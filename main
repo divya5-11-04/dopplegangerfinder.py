@@ -1,0 +1,166 @@
+"""dopplegangerfinder: find (and optionally remove) duplicate files fast.
+
+Strategy (why it's quick on big folders):
+  1. Group files by size. A unique size can't have a duplicate.
+  2. Hash only the first 64 KB of the survivors.
+  3. Fully hash only files that still collide.
+
+Usage:
+  python dopplegangerfinder.py ~/Downloads
+  python dopplegangerfinder.py ~/Downloads --delete --min-size 1048576
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import wraps
+from pathlib import Path
+from typing import Callable, Iterator
+
+CHUNK = 1024 * 1024
+HEAD = 64 * 1024
+
+
+@contextmanager
+def timer(label: str) -> Iterator[None]:
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        print(f"[{label}] {time.perf_counter() - start:.2f}s")
+
+
+def skip_unreadable(default):
+    """Decorator: return `default` if a file can't be read (permissions, vanished, etc.)."""
+    def deco(fn: Callable):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except OSError:
+                return default
+        return wrapper
+    return deco
+
+
+@dataclass(frozen=True, slots=True)
+class FileInfo:
+    path: Path
+    size: int
+
+
+@dataclass
+class DupeGroup:
+    size: int
+    files: list[Path] = field(default_factory=list)
+
+    @property
+    def wasted(self) -> int:
+        return self.size * (len(self.files) - 1)
+
+
+def scan(root: Path, min_size: int) -> Iterator[FileInfo]:
+    """Lazily walk the tree so huge folders don't blow up memory."""
+    for p in root.rglob("*"):
+        if p.is_symlink() or not p.is_file():
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size >= min_size:
+            yield FileInfo(p, size)
+
+
+@skip_unreadable(default=None)
+def hash_file(path: Path, head_only: bool = False) -> str:
+    h = hashlib.blake2b()
+    with path.open("rb") as f:
+        if head_only:
+            h.update(f.read(HEAD))
+        else:
+            while chunk := f.read(CHUNK):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def group_by(items, key: Callable) -> dict:
+    groups = defaultdict(list)
+    for item in items:
+        k = key(item)
+        if k is not None:
+            groups[k].append(item)
+    return groups
+
+
+def collisions(groups: dict) -> Iterator[list]:
+    return (g for g in groups.values() if len(g) > 1)
+
+
+def find_duplicates(root: Path, min_size: int = 1, workers: int = 8) -> list[DupeGroup]:
+    with timer("scan"):
+        by_size = group_by(scan(root, min_size), key=lambda f: f.size)
+
+    results: list[DupeGroup] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for same_size in collisions(by_size):
+            # Stage 1: cheap partial hash
+            heads = list(pool.map(lambda f: hash_file(f.path, head_only=True), same_size))
+            by_head = group_by(zip(same_size, heads), key=lambda t: t[1])
+
+            for head_group in collisions(by_head):
+                infos = [fi for fi, _ in head_group]
+                # Stage 2: full hash, only for real suspects
+                fulls = list(pool.map(lambda f: hash_file(f.path), infos))
+                by_full = group_by(zip(infos, fulls), key=lambda t: t[1])
+                for full_group in collisions(by_full):
+                    paths = sorted(fi.path for fi, _ in full_group)
+                    results.append(DupeGroup(full_group[0][0].size, paths))
+
+    return sorted(results, key=lambda g: g.wasted, reverse=True)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Find duplicate files.")
+    ap.add_argument("folder", type=Path)
+    ap.add_argument("--min-size", type=int, default=1, help="ignore files smaller than this (bytes)")
+    ap.add_argument("--delete", action="store_true", help="delete extras, keep the first copy")
+    args = ap.parse_args()
+
+    with timer("total"):
+        groups = find_duplicates(args.folder.expanduser(), args.min_size)
+
+    if not groups:
+        print("No duplicates found.")
+        return
+
+    for i, g in enumerate(groups, 1):
+        print(f"\n#{i}  {len(g.files)} copies, {human(g.size)} each (wastes {human(g.wasted)})")
+        for p in g.files:
+            print(f"   {p}")
+
+    total = sum(g.wasted for g in groups)
+    print(f"\nTotal reclaimable: {human(total)}")
+
+    if args.delete and input("Delete extras (keep first of each)? [y/N] ").lower() == "y":
+        for g in groups:
+            for p in g.files[1:]:
+                p.unlink()
+                print(f"deleted {p}")
+
+
+if __name__ == "__main__":
+    main()
